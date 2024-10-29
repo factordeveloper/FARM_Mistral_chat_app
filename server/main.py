@@ -1,57 +1,63 @@
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import List
-from database import collection
-from models import Message
-import os
-import httpx
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from pymongo import MongoClient
+from datetime import datetime
+import requests
+import os
 
+# Configuración de la aplicación
 app = FastAPI()
 
-# Permitir peticiones desde cualquier origen
+# Configuración CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Permite solo tu frontend React
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Permite todos los métodos (GET, POST, etc.)
-    allow_headers=["*"],  # Permite todos los encabezados
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-API_KEY = os.getenv("API_KEY", "your-huggingface-api-key")
-MODEL_URL = "https://api-inference.huggingface.co/models/mistralai/Mistral-Nemo-Instruct-2407/v1/chat/completions"
+# Conexión a MongoDB
+client = MongoClient("mongodb://localhost:27017")
+db = client["mistral_chatbot_db"]
+collection = db["prompts"]
 
-class Prompt(BaseModel):
+# Modelo para solicitud de prompt
+class PromptRequest(BaseModel):
     prompt: str
 
-@app.post("/ask", response_model=Message)
-async def ask(prompt_data: Prompt):
+@app.post("/api/prompt")
+async def send_prompt(request: PromptRequest):
+    api_key = "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"
+    prompt_text = request.prompt
+    #api_key = os.getenv("HF_API_KEY")
+
+    # Llamada a la API de Hugging Face
     headers = {
-        "Authorization": f"Bearer {API_KEY}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
     }
-    request_body = {
+    payload = {
         "model": "mistralai/Mistral-Nemo-Instruct-2407",
-        "messages": [{"role": "user", "content": prompt_data.prompt}],
+        "messages": [{"role": "user", "content": prompt_text}],
         "max_tokens": 500,
         "stream": False
     }
+    url = "https://api-inference.huggingface.co/models/mistralai/Mistral-Nemo-Instruct-2407/v1/chat/completions"
+    response = requests.post(url, headers=headers, json=payload)
 
-    async with httpx.AsyncClient() as client:
-        response = await client.post(MODEL_URL, headers=headers, json=request_body)
-        response_data = response.json()
-        
-        if "error" in response_data:
-            raise HTTPException(status_code=400, detail=response_data["error"]["message"])
+    if response.status_code != 200:
+        raise HTTPException(status_code=500, detail="Error in API request")
 
-        response_text = response_data["choices"][0]["message"]["content"]
-        
-        message = Message(prompt=prompt_data.prompt, response=response_text)
-        await collection.insert_one(message.dict(by_alias=True))
-        
-        return message
+    data = response.json()
+    response_text = data.get("choices", [{}])[0].get("message", {}).get("content", "No response available")
 
-@app.get("/history", response_model=List[Message])
-async def get_history():
-    messages = await collection.find().to_list(100)
-    return messages
+    # Guardar el prompt y la respuesta en MongoDB
+    collection.insert_one({
+        "prompt": prompt_text,
+        "response": response_text,
+        "timestamp": datetime.utcnow()
+    })
+
+    return {"response": response_text}
